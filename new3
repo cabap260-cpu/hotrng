@@ -1,0 +1,285 @@
+-- Hot's RNG utility (Delta)
+-- Gom: GUI, Anti AFK, Auto Rejoin 15m, Fly, Tele Tool, Auto Pray, Auto Pumpkin
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local VirtualUser = game:GetService("VirtualUser")
+local lp = Players.LocalPlayer
+
+local State = { AntiAFK = true, Rejoin = false, Fly = false, Pray = false, Pumpkin = false }
+local FLY_SPEED = 60
+local REJOIN_SECONDS = 15 * 60
+
+local function char() return lp.Character or lp.CharacterAdded:Wait() end
+local function hrp() return char():WaitForChild("HumanoidRootPart") end
+
+-- Anti AFK
+lp.Idled:Connect(function()
+    if State.AntiAFK then
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end
+end)
+
+-- Auto Rejoin moi 15 phut
+task.spawn(function()
+    local t = 0
+    while task.wait(1) do
+        if State.Rejoin then
+            t += 1
+            if t >= REJOIN_SECONDS then
+                t = 0
+                pcall(function() TeleportService:Teleport(game.PlaceId, lp) end)
+            end
+        else
+            t = 0
+        end
+    end
+end)
+
+-- Fly
+local flyBV, flyBG
+local function setFly(on)
+    State.Fly = on
+    local root = hrp()
+    if on then
+        flyBV = Instance.new("BodyVelocity")
+        flyBV.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+        flyBV.Velocity = Vector3.zero
+        flyBV.Parent = root
+        flyBG = Instance.new("BodyGyro")
+        flyBG.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+        flyBG.P = 9e4
+        flyBG.Parent = root
+        char():FindFirstChildOfClass("Humanoid").PlatformStand = true
+    else
+        if flyBV then flyBV:Destroy() end
+        if flyBG then flyBG:Destroy() end
+        local h = char():FindFirstChildOfClass("Humanoid")
+        if h then h.PlatformStand = false end
+    end
+end
+
+RunService.RenderStepped:Connect(function()
+    if not State.Fly or not flyBV then return end
+    local cam = workspace.CurrentCamera
+    local dir = Vector3.zero
+    if UIS:IsKeyDown(Enum.KeyCode.W) then dir += cam.CFrame.LookVector end
+    if UIS:IsKeyDown(Enum.KeyCode.S) then dir -= cam.CFrame.LookVector end
+    if UIS:IsKeyDown(Enum.KeyCode.A) then dir -= cam.CFrame.RightVector end
+    if UIS:IsKeyDown(Enum.KeyCode.D) then dir += cam.CFrame.RightVector end
+    if UIS:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+    if UIS:IsKeyDown(Enum.KeyCode.LeftShift) then dir -= Vector3.yAxis end
+    -- tren mobile: dung huong di chuyen cua Humanoid
+    local h = char():FindFirstChildOfClass("Humanoid")
+    if dir.Magnitude == 0 and h and h.MoveDirection.Magnitude > 0 then
+        dir = cam.CFrame:VectorToWorldSpace(
+            Vector3.new(h.MoveDirection.X, 0, h.MoveDirection.Z)).Unit
+        dir = Vector3.new(h.MoveDirection.X, cam.CFrame.LookVector.Y * h.MoveDirection.Magnitude, h.MoveDirection.Z)
+    end
+    flyBV.Velocity = dir.Magnitude > 0 and dir.Unit * FLY_SPEED or Vector3.zero
+    flyBG.CFrame = cam.CFrame
+end)
+
+lp.CharacterAdded:Connect(function() State.Fly = false end)
+
+-- Tele Tool (bam vao dau teleport toi do)
+local function giveTeleTool()
+    if lp.Backpack:FindFirstChild("TeleTool") then return end
+    local tool = Instance.new("Tool")
+    tool.Name = "TeleTool"
+    tool.RequiresHandle = false
+    tool.CanBeDropped = false
+    tool.Activated:Connect(function()
+        local mouse = lp:GetMouse()
+        if mouse.Hit then
+            hrp().CFrame = CFrame.new(mouse.Hit.Position + Vector3.new(0, 4, 0))
+        end
+    end)
+    tool.Parent = lp.Backpack
+end
+
+-- Auto Pray: tim ProximityPrompt / ClickDetector co ten chua "pray"
+local function fireByName(keyword)
+    for _, d in ipairs(workspace:GetDescendants()) do
+        local n = d.Name:lower()
+        local parentName = d.Parent and d.Parent.Name:lower() or ""
+        if n:find(keyword) or parentName:find(keyword) then
+            if d:IsA("ProximityPrompt") and fireproximityprompt then
+                pcall(fireproximityprompt, d)
+            elseif d:IsA("ClickDetector") and fireclickdetector then
+                pcall(fireclickdetector, d)
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    while task.wait(2) do
+        if State.Pray then pcall(fireByName, "pray") end
+    end
+end)
+
+-- Auto Pumpkin: cham vao part ten "pumpkin"
+task.spawn(function()
+    while task.wait(0.5) do
+        if State.Pumpkin then
+            pcall(function()
+                local root = hrp()
+                for _, d in ipairs(workspace:GetDescendants()) do
+                    if d:IsA("BasePart") and d.Name:lower():find("pumpkin") then
+                        if firetouchinterest then
+                            firetouchinterest(root, d, 0)
+                            firetouchinterest(root, d, 1)
+                        else
+                            root.CFrame = d.CFrame
+                            task.wait(0.15)
+                        end
+                    end
+                    local pp = d:IsA("ProximityPrompt") and d
+                    if pp and pp.Parent and pp.Parent.Name:lower():find("pumpkin") and fireproximityprompt then
+                        fireproximityprompt(pp)
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+-- Nhap code: thu ten remote pho bien. Sua REDEEM_REMOTE neu biet ten that.
+local REDEEM_REMOTE = nil -- vd: game.ReplicatedStorage.Remotes.RedeemCode
+local function redeem(code)
+    if REDEEM_REMOTE then
+        pcall(function() REDEEM_REMOTE:FireServer(code) end)
+        return
+    end
+    for _, d in ipairs(game:GetService("ReplicatedStorage"):GetDescendants()) do
+        if d:IsA("RemoteEvent") and d.Name:lower():find("code") then
+            pcall(function() d:FireServer(code) end)
+        end
+    end
+end
+
+-- GUI
+local parent = (gethui and gethui()) or game:GetService("CoreGui")
+local old = parent:FindFirstChild("HotsRNGMenu")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "HotsRNGMenu"
+gui.ResetOnSpawn = false
+gui.Parent = parent
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 220, 0, 380)
+frame.Position = UDim2.new(0, 20, 0.5, -190)
+frame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 32)
+title.BackgroundTransparency = 1
+title.Text = "Hot's RNG Menu"
+title.TextColor3 = Color3.fromRGB(255, 140, 0)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 16
+title.Parent = frame
+
+local layout = Instance.new("UIListLayout", frame)
+layout.Padding = UDim.new(0, 6)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+title.LayoutOrder = 0
+
+local function toggle(text, order, key, onChange)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, -16, 0, 30)
+    b.LayoutOrder = order
+    b.Font = Enum.Font.Gotham
+    b.TextSize = 14
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.BorderSizePixel = 0
+    b.Parent = frame
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    local function refresh()
+        b.Text = text .. ": " .. (State[key] and "ON" or "OFF")
+        b.BackgroundColor3 = State[key] and Color3.fromRGB(40, 140, 60) or Color3.fromRGB(70, 70, 80)
+    end
+    b.MouseButton1Click:Connect(function()
+        State[key] = not State[key]
+        refresh()
+        if onChange then onChange(State[key]) end
+    end)
+    refresh()
+end
+
+toggle("Anti AFK", 1, "AntiAFK")
+toggle("Auto Rejoin 15m", 2, "Rejoin")
+toggle("Fly", 3, "Fly", setFly)
+toggle("Auto Pray", 4, "Pray")
+toggle("Auto Pumpkin", 5, "Pumpkin")
+
+local tele = Instance.new("TextButton")
+tele.Size = UDim2.new(1, -16, 0, 30)
+tele.LayoutOrder = 6
+tele.Text = "Lay Tele Tool"
+tele.Font = Enum.Font.Gotham
+tele.TextSize = 14
+tele.TextColor3 = Color3.new(1, 1, 1)
+tele.BackgroundColor3 = Color3.fromRGB(60, 90, 160)
+tele.BorderSizePixel = 0
+tele.Parent = frame
+Instance.new("UICorner", tele).CornerRadius = UDim.new(0, 6)
+tele.MouseButton1Click:Connect(giveTeleTool)
+
+local box = Instance.new("TextBox")
+box.Size = UDim2.new(1, -16, 0, 30)
+box.LayoutOrder = 7
+box.PlaceholderText = "Nhap code..."
+box.Text = ""
+box.Font = Enum.Font.Gotham
+box.TextSize = 14
+box.TextColor3 = Color3.new(1, 1, 1)
+box.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+box.BorderSizePixel = 0
+box.Parent = frame
+Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+
+local redeemBtn = Instance.new("TextButton")
+redeemBtn.Size = UDim2.new(1, -16, 0, 30)
+redeemBtn.LayoutOrder = 8
+redeemBtn.Text = "Redeem"
+redeemBtn.Font = Enum.Font.Gotham
+redeemBtn.TextSize = 14
+redeemBtn.TextColor3 = Color3.new(1, 1, 1)
+redeemBtn.BackgroundColor3 = Color3.fromRGB(140, 90, 30)
+redeemBtn.BorderSizePixel = 0
+redeemBtn.Parent = frame
+Instance.new("UICorner", redeemBtn).CornerRadius = UDim.new(0, 6)
+redeemBtn.MouseButton1Click:Connect(function()
+    if box.Text ~= "" then redeem(box.Text) end
+end)
+
+local hide = Instance.new("TextButton")
+hide.Size = UDim2.new(1, -16, 0, 26)
+hide.LayoutOrder = 9
+hide.Text = "An menu (RightCtrl de hien lai)"
+hide.Font = Enum.Font.Gotham
+hide.TextSize = 12
+hide.TextColor3 = Color3.new(1, 1, 1)
+hide.BackgroundColor3 = Color3.fromRGB(100, 40, 40)
+hide.BorderSizePixel = 0
+hide.Parent = frame
+Instance.new("UICorner", hide).CornerRadius = UDim.new(0, 6)
+hide.MouseButton1Click:Connect(function() frame.Visible = false end)
+
+UIS.InputBegan:Connect(function(i, gp)
+    if not gp and i.KeyCode == Enum.KeyCode.RightControl then
+        frame.Visible = not frame.Visible
+    end
+end)
