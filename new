@@ -1,0 +1,506 @@
+--====================================================================--
+--             HOT'S RNG - MOBILE EDITION (TOUCH OPTIMIZED)           --
+--====================================================================--
+
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
+local Camera = Workspace.CurrentCamera
+
+-- Trạng thái các tính năng
+local State = {
+    AntiAFK = false,
+    AntiKick = false,
+    AutoRejoin = false,
+    AutoPray = false,
+    AutoPumpkin = false,
+    Fly = false,
+    FlySpeed = 55,
+    VerticalDir = 0 -- 1: Lên, -1: Xuống, 0: Đứng yên
+}
+
+--====================================================================--
+-- HÀM HỖ TRỢ KÉO THẢ CẢM ỨNG (MOBILE TOUCH DRAG)
+--====================================================================--
+local function MakeTouchDraggable(frame)
+    local dragging = false
+    local dragInput, dragStart, startPos
+
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    frame.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+--====================================================================--
+-- 1. KHỞI TẠO MENU GUI CHO ĐIỆN THOẠI
+--====================================================================--
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "HotsRNG_MobileHub"
+ScreenGui.ResetOnSpawn = false
+
+local success = pcall(function()
+    ScreenGui.Parent = gethui and gethui() or game:GetService("CoreGui")
+end)
+if not success then
+    ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- Nút nổi (Floating Button) để Ẩn/Hiện Menu trên điện thoại
+local FloatingBtn = Instance.new("TextButton")
+FloatingBtn.Size = UDim2.new(0, 55, 0, 55)
+FloatingBtn.Position = UDim2.new(0.05, 0, 0.2, 0)
+FloatingBtn.BackgroundColor3 = Color3.fromRGB(255, 85, 0)
+FloatingBtn.Text = "🔥\nMENU"
+FloatingBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+FloatingBtn.Font = Enum.Font.GothamBold
+FloatingBtn.TextSize = 12
+FloatingBtn.Parent = ScreenGui
+
+local FloatCorner = Instance.new("UICorner")
+FloatCorner.CornerRadius = UDim.new(1, 0)
+FloatCorner.Parent = FloatingBtn
+
+local FloatStroke = Instance.new("UIStroke")
+FloatStroke.Color = Color3.fromRGB(255, 255, 255)
+FloatStroke.Thickness = 2
+FloatStroke.Parent = FloatingBtn
+
+MakeTouchDraggable(FloatingBtn)
+
+-- Khung Menu Chính (Tối ưu kích thước cho màn hình ngang điện thoại)
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 260, 0, 270)
+MainFrame.Position = UDim2.new(0.5, -130, 0.5, -135)
+MainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+MainFrame.BorderSizePixel = 0
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 10)
+MainCorner.Parent = MainFrame
+
+MakeTouchDraggable(MainFrame)
+
+-- Sự kiện chạm nút nổi để đóng/mở Menu
+FloatingBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = not MainFrame.Visible
+end)
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 36)
+Title.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+Title.Text = "🔥 Hot's RNG Mobile"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 14
+Title.Parent = MainFrame
+
+local TitleCorner = Instance.new("UICorner")
+TitleCorner.CornerRadius = UDim.new(0, 10)
+TitleCorner.Parent = Title
+
+local Container = Instance.new("ScrollingFrame")
+Container.Size = UDim2.new(1, -16, 1, -46)
+Container.Position = UDim2.new(0, 8, 0, 40)
+Container.BackgroundTransparency = 1
+Container.ScrollBarThickness = 5
+Container.CanvasSize = UDim2.new(0, 0, 0, 310)
+Container.Parent = MainFrame
+
+local UIListLayout = Instance.new("UIListLayout")
+UIListLayout.Padding = UDim.new(0, 6)
+UIListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+UIListLayout.Parent = Container
+
+local function CreateToggle(text, callback)
+    local Button = Instance.new("TextButton")
+    Button.Size = UDim2.new(1, -6, 0, 36)
+    Button.BackgroundColor3 = Color3.fromRGB(45, 45, 60)
+    Button.Text = text .. ": TẮT"
+    Button.TextColor3 = Color3.fromRGB(220, 220, 220)
+    Button.Font = Enum.Font.GothamSemibold
+    Button.TextSize = 13
+    Button.Parent = Container
+
+    local BtnCorner = Instance.new("UICorner")
+    BtnCorner.CornerRadius = UDim.new(0, 6)
+    BtnCorner.Parent = Button
+
+    local enabled = false
+    Button.MouseButton1Click:Connect(function()
+        enabled = not enabled
+        if enabled then
+            Button.Text = text .. ": BẬT"
+            Button.BackgroundColor3 = Color3.fromRGB(40, 160, 80)
+            Button.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            Button.Text = text .. ": TẮT"
+            Button.BackgroundColor3 = Color3.fromRGB(45, 45, 60)
+            Button.TextColor3 = Color3.fromRGB(220, 220, 220)
+        end
+        callback(enabled)
+    end)
+end
+
+local function CreateButton(text, callback)
+    local Button = Instance.new("TextButton")
+    Button.Size = UDim2.new(1, -6, 0, 36)
+    Button.BackgroundColor3 = Color3.fromRGB(60, 100, 180)
+    Button.Text = text
+    Button.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Button.Font = Enum.Font.GothamBold
+    Button.TextSize = 13
+    Button.Parent = Container
+
+    local BtnCorner = Instance.new("UICorner")
+    BtnCorner.CornerRadius = UDim.new(0, 6)
+    BtnCorner.Parent = Button
+
+    Button.MouseButton1Click:Connect(callback)
+end
+
+--====================================================================--
+-- 2. NÚT ĐIỀU KHIỂN ĐỘ CAO KHI BAY TRÊN MOBILE (LÊN / XUỐNG)
+--====================================================================--
+local FlyControls = Instance.new("Frame")
+FlyControls.Size = UDim2.new(0, 60, 0, 110)
+FlyControls.Position = UDim2.new(0.85, 0, 0.45, 0)
+FlyControls.BackgroundTransparency = 1
+FlyControls.Visible = false
+FlyControls.Parent = ScreenGui
+
+local UpBtn = Instance.new("TextButton")
+UpBtn.Size = UDim2.new(1, 0, 0, 50)
+UpBtn.Position = UDim2.new(0, 0, 0, 0)
+UpBtn.BackgroundColor3 = Color3.fromRGB(40, 140, 200)
+UpBtn.BackgroundTransparency = 0.2
+UpBtn.Text = "⬆️\nLÊN"
+UpBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+UpBtn.Font = Enum.Font.GothamBold
+UpBtn.TextSize = 12
+UpBtn.Parent = FlyControls
+
+local UpCorner = Instance.new("UICorner")
+UpCorner.CornerRadius = UDim.new(0, 8)
+UpCorner.Parent = UpBtn
+
+local DownBtn = Instance.new("TextButton")
+DownBtn.Size = UDim2.new(1, 0, 0, 50)
+DownBtn.Position = UDim2.new(0, 0, 0, 60)
+DownBtn.BackgroundColor3 = Color3.fromRGB(200, 80, 60)
+DownBtn.BackgroundTransparency = 0.2
+DownBtn.Text = "⬇️\nXUỐNG"
+DownBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+DownBtn.Font = Enum.Font.GothamBold
+DownBtn.TextSize = 12
+DownBtn.Parent = FlyControls
+
+local DownCorner = Instance.new("UICorner")
+DownCorner.CornerRadius = UDim.new(0, 8)
+DownCorner.Parent = DownBtn
+
+UpBtn.MouseButton1Down:Connect(function() State.VerticalDir = 1 end)
+UpBtn.MouseButton1Up:Connect(function() State.VerticalDir = 0 end)
+UpBtn.MouseLeave:Connect(function() State.VerticalDir = 0 end)
+
+DownBtn.MouseButton1Down:Connect(function() State.VerticalDir = -1 end)
+DownBtn.MouseButton1Up:Connect(function() State.VerticalDir = 0 end)
+DownBtn.MouseLeave:Connect(function() State.VerticalDir = 0 end)
+
+--====================================================================--
+-- 3. TÍNH NĂNG: ANTI AFK & ANTI KICK
+--====================================================================--
+LocalPlayer.Idled:Connect(function()
+    if State.AntiAFK then
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end
+end)
+
+local antiKickLoaded = false
+local function EnableAntiKick()
+    if antiKickLoaded then return end
+    pcall(function()
+        local mt = getrawmetatable(game)
+        local oldNamecall = mt.__namecall
+        setreadonly(mt, false)
+        mt.__namecall = newcclosure(function(self, ...)
+            local method = getnamecallmethod()
+            if State.AntiKick and (method == "Kick" or method == "kick") and self == LocalPlayer then
+                return nil
+            end
+            return oldNamecall(self, ...)
+        end)
+        setreadonly(mt, true)
+        antiKickLoaded = true
+    end)
+end
+
+--====================================================================--
+-- 4. TÍNH NĂNG: AUTO REJOIN 15 PHÚT
+--====================================================================--
+task.spawn(function()
+    local timer = 0
+    while task.wait(1) do
+        if State.AutoRejoin then
+            timer = timer + 1
+            if timer >= 900 then -- 15 phút
+                timer = 0
+                pcall(function()
+                    TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+                end)
+            end
+        else
+            timer = 0
+        end
+    end
+end)
+
+--====================================================================--
+-- 5. TÍNH NĂNG: AUTO PRAY & AUTO COLLECT PUMPKIN
+--====================================================================--
+local function TriggerInteract(obj)
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+    local clicker = obj:FindFirstChildWhichIsA("ClickDetector", true)
+    local targetPart = obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart", true)
+
+    if targetPart then
+        root.CFrame = targetPart.CFrame + Vector3.new(0, 3, 0)
+        task.wait(0.2)
+    end
+
+    if prompt then
+        if fireproximityprompt then
+            fireproximityprompt(prompt)
+        else
+            prompt:InputHoldBegin()
+            task.wait(prompt.HoldDuration + 0.1)
+            prompt:InputHoldEnd()
+        end
+    elseif clicker and fireclickdetector then
+        fireclickdetector(clicker)
+    end
+end
+
+-- Vòng lặp Auto Pray
+task.spawn(function()
+    while task.wait(2) do
+        if State.AutoPray then
+            pcall(function()
+                for _, v in pairs(ReplicatedStorage:GetDescendants()) do
+                    if (v:IsA("RemoteEvent") or v:IsA("RemoteFunction")) and 
+                       (string.find(string.lower(v.Name), "pray") or string.find(string.lower(v.Name), "shrine")) then
+                        if v:IsA("RemoteEvent") then v:FireServer() else v:InvokeServer() end
+                    end
+                end
+
+                for _, obj in pairs(Workspace:GetDescendants()) do
+                    local name = string.lower(obj.Name)
+                    if (string.find(name, "pray") or string.find(name, "shrine") or string.find(name, "altar")) and 
+                       (obj:IsA("Model") or obj:IsA("BasePart")) then
+                        if obj:FindFirstChildWhichIsA("ProximityPrompt", true) or obj:FindFirstChildWhichIsA("ClickDetector", true) then
+                            TriggerInteract(obj)
+                            break
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+-- Vòng lặp Auto Collect Pumpkin
+task.spawn(function()
+    while task.wait(0.5) do
+        if State.AutoPumpkin then
+            pcall(function()
+                local char = LocalPlayer.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if not root then return end
+
+                for _, obj in pairs(Workspace:GetDescendants()) do
+                    if not State.AutoPumpkin then break end
+                    local name = string.lower(obj.Name)
+                    if (string.find(name, "pumpkin") or string.find(name, "pumkin")) and 
+                       (obj:IsA("BasePart") or obj:IsA("Model")) then
+                        
+                        local part = obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart", true)
+                        if part and part.Parent then
+                            root.CFrame = part.CFrame + Vector3.new(0, 2, 0)
+                            
+                            if firetouchinterest then
+                                firetouchinterest(root, part, 0)
+                                task.wait(0.05)
+                                firetouchinterest(root, part, 1)
+                            end
+
+                            local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+                            if prompt then
+                                if fireproximityprompt then
+                                    fireproximityprompt(prompt)
+                                else
+                                    prompt:InputHoldBegin()
+                                    task.wait(prompt.HoldDuration)
+                                    prompt:InputHoldEnd()
+                                end
+                            end
+                            task.wait(0.25)
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+--====================================================================--
+-- 6. TÍNH NĂNG: MOBILE FLY (ĐIỀU KHIỂN BẰNG JOYSTICK CẢM ỨNG)
+--====================================================================--
+local bv, bg
+local function StopFly()
+    FlyControls.Visible = false
+    State.VerticalDir = 0
+    if bv then bv:Destroy() bv = nil end
+    if bg then bg:Destroy() bg = nil end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum then hum.PlatformStand = false end
+end
+
+local function StartFly()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum then return end
+
+    StopFly()
+    FlyControls.Visible = true
+    hum.PlatformStand = true
+
+    bg = Instance.new("BodyGyro")
+    bg.P = 9e4
+    bg.maxTorque = Vector3.new(9e9, 9e9, 9e9)
+    bg.cframe = root.CFrame
+    bg.Parent = root
+
+    bv = Instance.new("BodyVelocity")
+    bv.velocity = Vector3.new(0, 0, 0)
+    bv.maxForce = Vector3.new(9e9, 9e9, 9e9)
+    bv.Parent = root
+end
+
+RunService.RenderStepped:Connect(function()
+    if State.Fly and bv and bg and LocalPlayer.Character then
+        local root = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if root and hum then
+            -- Nhận hướng kéo từ nút di chuyển (Joystick) trên màn hình điện thoại
+            local moveDir = hum.MoveDirection
+            local verticalVel = Vector3.new(0, State.VerticalDir * State.FlySpeed, 0)
+
+            -- Kết hợp bay theo hướng nhìn Camera + Nút Lên/Xuống
+            if moveDir.Magnitude > 0 then
+                local camLookY = Camera.CFrame.LookVector.Y
+                bv.velocity = (moveDir * State.FlySpeed) + Vector3.new(0, camLookY * State.FlySpeed, 0) + verticalVel
+            else
+                bv.velocity = verticalVel
+            end
+            bg.cframe = Camera.CFrame
+        end
+    end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(1)
+    if State.Fly then StartFly() end
+end)
+
+--====================================================================--
+-- 7. TÍNH NĂNG: TELE TOOL (CHẠM MÀN HÌNH ĐỂ DỊCH CHUYỂN)
+--====================================================================--
+local function GiveTeleTool()
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if not backpack then return end
+
+    if backpack:FindFirstChild("Tele Tool") then backpack["Tele Tool"]:Destroy() end
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Tele Tool") then
+        LocalPlayer.Character["Tele Tool"]:Destroy()
+    end
+
+    local tool = Instance.new("Tool")
+    tool.Name = "Tele Tool"
+    tool.RequiresHandle = false
+    tool.CanBeDropped = false
+
+    tool.Activated:Connect(function()
+        local char = LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if root and Mouse.Hit then
+            root.CFrame = CFrame.new(Mouse.Hit.Position + Vector3.new(0, 3.5, 0))
+        end
+    end)
+
+    tool.Parent = backpack
+end
+
+--====================================================================--
+-- 8. GẮN CÁC NÚT VÀO MENU
+--====================================================================--
+CreateToggle("Anti AFK", function(val) State.AntiAFK = val end)
+
+CreateToggle("Anti Kick", function(val)
+    State.AntiKick = val
+    if val then EnableAntiKick() end
+end)
+
+CreateToggle("Auto Rejoin (15 Phút)", function(val) State.AutoRejoin = val end)
+
+CreateToggle("Auto Pray (Cầu nguyện)", function(val) State.AutoPray = val end)
+
+CreateToggle("Auto Collect Pumpkin", function(val) State.AutoPumpkin = val end)
+
+CreateToggle("Fly Mobile (Joystick)", function(val)
+    State.Fly = val
+    if val then StartFly() else StopFly() end
+end)
+
+CreateButton("Nhận Tele Tool (Chạm để Tele)", function()
+    GiveTeleTool()
+end)
