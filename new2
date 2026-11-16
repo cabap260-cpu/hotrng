@@ -1,0 +1,498 @@
+--[[
+  Hot's RNG helper  |  target executor: Delta (mobile/PC)
+  Features: Auto Rejoin 15m, Anti AFK, Anti Kick, Auto Pray, Auto Pumpkin,
+            GUI menu, Fly, Teleport Tool, Redeem codes.
+
+  IMPORTANT (unverified game parts): remote/prompt names of Hot's RNG were NOT
+  verified. Pray / Pumpkin / Codes use a name-pattern scanner. Check the
+  Log line in the GUI to see what was found, and edit CONFIG patterns if needed.
+
+  For Auto Rejoin to reload this script: save it in Delta's workspace as
+  HotsRNG.lua (or set CONFIG.SCRIPT_URL).
+]]
+
+if getgenv().HotsRNG_Loaded then
+    pcall(function() getgenv().HotsRNG_Unload() end)
+end
+getgenv().HotsRNG_Loaded = true
+
+local CONFIG = {
+    REJOIN_MINUTES = 15,
+    SCRIPT_FILE    = "HotsRNG.lua",
+    SCRIPT_URL     = "",              -- optional raw URL for rejoin reload
+    PRAY_INTERVAL  = 5,               -- seconds between pray attempts
+    PUMPKIN_SCAN   = 1.0,             -- seconds between pumpkin scans
+    PRAY_PATTERNS    = { "pray", "altar", "shrine" },
+    PUMPKIN_PATTERNS = { "pumpkin" },
+    CODE_REMOTE_PATTERNS = { "redeem", "code" },
+    CODES = {                         -- put valid codes here (not verified)
+        -- "EXAMPLECODE",
+    },
+    FLY_SPEED = 60,
+}
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local TeleportService  = game:GetService("TeleportService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser      = game:GetService("VirtualUser")
+local ReplicatedStorage= game:GetService("ReplicatedStorage")
+local CoreGui          = game:GetService("CoreGui")
+local LP = Players.LocalPlayer
+
+local State = { AutoPray=false, AutoPumpkin=false, Fly=false, AutoRejoin=true, AntiAFK=true }
+local conns, alive = {}, true
+local function track(c) conns[#conns+1] = c return c end
+
+local logLabel
+local function log(msg)
+    msg = tostring(msg)
+    if logLabel then logLabel.Text = "Log: " .. msg end
+end
+
+local function lower(s) return string.lower(tostring(s)) end
+local function matches(name, patterns)
+    local n = lower(name)
+    for _, p in ipairs(patterns) do if string.find(n, p, 1, true) then return true end end
+    return false
+end
+local function root()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart"), c and c:FindFirstChildOfClass("Humanoid")
+end
+
+---------------------------------------------------------------- Anti AFK
+track(LP.Idled:Connect(function()
+    if not State.AntiAFK then return end
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end))
+task.spawn(function()
+    while alive do
+        task.wait(60)
+        if State.AntiAFK then
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new())
+            end)
+        end
+    end
+end)
+
+---------------------------------------------------------------- Anti Kick
+do
+    local ok, err = pcall(function()
+        assert(hookmetamethod and getnamecallmethod, "hookmetamethod unsupported")
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            if self == LP and typeof(method) == "string" and lower(method) == "kick" then
+                return
+            end
+            return oldNamecall(self, ...)
+        end)
+        local oldIndex
+        oldIndex = hookmetamethod(game, "__index", function(self, key)
+            if self == LP and typeof(key) == "string" and lower(key) == "kick" then
+                return function() end
+            end
+            return oldIndex(self, key)
+        end)
+    end)
+    if not ok then warn("[HotsRNG] AntiKick not active: " .. tostring(err)) end
+end
+
+---------------------------------------------------------------- Auto Rejoin
+local function queueReload()
+    local q = queue_on_teleport or (syn and syn.queue_on_teleport)
+    if not q then return end
+    local code
+    if CONFIG.SCRIPT_URL ~= "" then
+        code = ('loadstring(game:HttpGet("%s"))()'):format(CONFIG.SCRIPT_URL)
+    else
+        code = ('local f=isfile and isfile("%s") and readfile("%s"); if f then loadstring(f)() end')
+            :format(CONFIG.SCRIPT_FILE, CONFIG.SCRIPT_FILE)
+    end
+    pcall(q, code)
+end
+local startTick = tick()
+task.spawn(function()
+    while alive do
+        task.wait(5)
+        if State.AutoRejoin and tick() - startTick >= CONFIG.REJOIN_MINUTES * 60 then
+            queueReload()
+            local ok = pcall(function() TeleportService:Teleport(game.PlaceId, LP) end)
+            startTick = tick() + 30 -- retry delay if teleport failed
+            if not ok then log("rejoin failed, retrying") end
+        end
+    end
+end)
+-- also rejoin on error prompt (kick/disconnect)
+pcall(function()
+    track(game:GetService("GuiService").ErrorMessageChanged:Connect(function()
+        if State.AutoRejoin then
+            queueReload()
+            task.wait(2)
+            pcall(function() TeleportService:Teleport(game.PlaceId, LP) end)
+        end
+    end))
+end)
+
+---------------------------------------------------------------- helpers: scan / fire
+local function fireTarget(inst)
+    if inst:IsA("ProximityPrompt") then
+        if fireproximityprompt then fireproximityprompt(inst) return true end
+    elseif inst:IsA("ClickDetector") then
+        if fireclickdetector then fireclickdetector(inst) return true end
+    elseif inst:IsA("RemoteEvent") then
+        inst:FireServer() return true
+    elseif inst:IsA("RemoteFunction") then
+        task.spawn(function() pcall(inst.InvokeServer, inst) end) return true
+    end
+    return false
+end
+
+local function findInteractables(patterns, scope)
+    local out = {}
+    for _, d in ipairs(scope:GetDescendants()) do
+        if d:IsA("ProximityPrompt") or d:IsA("ClickDetector") then
+            local p = d.Parent
+            if matches(d.Name, patterns) or (p and matches(p.Name, patterns))
+               or (p and p.Parent and matches(p.Parent.Name, patterns)) then
+                out[#out+1] = d
+            end
+        end
+    end
+    return out
+end
+
+local function findRemotes(patterns)
+    local out = {}
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        if (d:IsA("RemoteEvent") or d:IsA("RemoteFunction")) and matches(d.Name, patterns) then
+            out[#out+1] = d
+        end
+    end
+    return out
+end
+
+local function partOf(inst)
+    if inst:IsA("BasePart") then return inst end
+    local p = inst.Parent
+    while p and not p:IsA("BasePart") do
+        if p:IsA("Model") then return p.PrimaryPart or p:FindFirstChildWhichIsA("BasePart", true) end
+        p = p.Parent
+    end
+    return p
+end
+
+---------------------------------------------------------------- Auto Pray
+task.spawn(function()
+    while alive do
+        task.wait(CONFIG.PRAY_INTERVAL)
+        if State.AutoPray then
+            local fired = 0
+            for _, r in ipairs(findRemotes(CONFIG.PRAY_PATTERNS)) do
+                if fireTarget(r) then fired += 1 end
+            end
+            if fired == 0 then
+                local hrp = root()
+                for _, it in ipairs(findInteractables(CONFIG.PRAY_PATTERNS, workspace)) do
+                    local part = partOf(it)
+                    if hrp and part and (hrp.Position - part.Position).Magnitude <= 60 then
+                        if fireTarget(it) then fired += 1 end
+                    end
+                end
+            end
+            log(fired > 0 and ("pray fired x" .. fired) or "pray: no remote/prompt matched")
+        end
+    end
+end)
+
+---------------------------------------------------------------- Auto Pumpkin (Halloween)
+local function collectPumpkin(obj)
+    local hrp = root()
+    local part = partOf(obj)
+    if not (hrp and part) then return false end
+    if obj:IsA("ProximityPrompt") or obj:IsA("ClickDetector") then
+        local back = hrp.CFrame
+        hrp.CFrame = part.CFrame + Vector3.new(0, 3, 0)
+        task.wait(0.15)
+        fireTarget(obj)
+        task.wait(0.15)
+        hrp.CFrame = back
+        return true
+    end
+    return false
+end
+
+task.spawn(function()
+    while alive do
+        task.wait(CONFIG.PUMPKIN_SCAN)
+        if State.AutoPumpkin and root() then
+            local n = 0
+            local list = findInteractables(CONFIG.PUMPKIN_PATTERNS, workspace)
+            for _, it in ipairs(list) do
+                if not State.AutoPumpkin or not it.Parent then break end
+                if collectPumpkin(it) then n += 1 end
+            end
+            -- fallback: touch-based pickups
+            if #list == 0 and firetouchinterest then
+                local hrp = root()
+                for _, d in ipairs(workspace:GetDescendants()) do
+                    if d:IsA("BasePart") and d:FindFirstChildOfClass("TouchTransmitter")
+                       and (matches(d.Name, CONFIG.PUMPKIN_PATTERNS)
+                            or (d.Parent and matches(d.Parent.Name, CONFIG.PUMPKIN_PATTERNS))) then
+                        pcall(function()
+                            firetouchinterest(hrp, d, 0)
+                            firetouchinterest(hrp, d, 1)
+                        end)
+                        n += 1
+                    end
+                end
+            end
+            log(n > 0 and ("pumpkin collected x" .. n) or "pumpkin: none found")
+        end
+    end
+end)
+
+---------------------------------------------------------------- Redeem codes
+local function redeemCodes(codes)
+    codes = codes or CONFIG.CODES
+    if #codes == 0 then log("no codes to redeem") return end
+    local remotes = findRemotes(CONFIG.CODE_REMOTE_PATTERNS)
+    if #remotes == 0 then log("code remote not found") return end
+    local used = 0
+    for _, code in ipairs(codes) do
+        for _, r in ipairs(remotes) do
+            pcall(function()
+                if r:IsA("RemoteEvent") then r:FireServer(code) else r:InvokeServer(code) end
+            end)
+        end
+        used += 1
+        task.wait(0.8)
+    end
+    log("redeem sent: " .. used .. " code(s) via " .. #remotes .. " remote(s)")
+end
+
+---------------------------------------------------------------- Fly
+local flyBV, flyBG, flyUp, flyDown = nil, nil, false, false
+local function stopFly()
+    if flyBV then flyBV:Destroy() flyBV = nil end
+    if flyBG then flyBG:Destroy() flyBG = nil end
+    local _, hum = root()
+    if hum then hum.PlatformStand = false end
+end
+local function startFly()
+    local hrp, hum = root()
+    if not hrp then return end
+    stopFly()
+    flyBV = Instance.new("BodyVelocity")
+    flyBV.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+    flyBV.Velocity = Vector3.zero
+    flyBV.Parent = hrp
+    flyBG = Instance.new("BodyGyro")
+    flyBG.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+    flyBG.P = 1e4
+    flyBG.Parent = hrp
+    hum.PlatformStand = true
+end
+track(RunService.RenderStepped:Connect(function()
+    if not State.Fly then return end
+    local hrp, hum = root()
+    if not (hrp and hum and flyBV and flyBV.Parent) then return end
+    local cam = workspace.CurrentCamera
+    local move = hum.MoveDirection
+    local vel = Vector3.zero
+    if move.Magnitude > 0 then
+        -- project movement onto camera so looking up/down changes altitude
+        local look = cam.CFrame.LookVector
+        local right = cam.CFrame.RightVector
+        local fwd = move:Dot(Vector3.new(look.X, 0, look.Z).Unit)
+        local side = move:Dot(Vector3.new(right.X, 0, right.Z).Unit)
+        vel = look * fwd + right * side
+    end
+    if flyUp then vel += Vector3.yAxis end
+    if flyDown then vel -= Vector3.yAxis end
+    flyBV.Velocity = vel * CONFIG.FLY_SPEED
+    flyBG.CFrame = cam.CFrame
+end))
+track(LP.CharacterAdded:Connect(function()
+    task.wait(1)
+    if State.Fly then startFly() end
+end))
+local function setFly(v)
+    State.Fly = v
+    if v then startFly() else stopFly() end
+end
+
+---------------------------------------------------------------- Teleport tool
+local function giveTpTool()
+    local bp = LP:FindFirstChildOfClass("Backpack")
+    if not bp then return end
+    if bp:FindFirstChild("Teleport Tool") or (LP.Character and LP.Character:FindFirstChild("Teleport Tool")) then return end
+    local tool = Instance.new("Tool")
+    tool.Name = "Teleport Tool"
+    tool.RequiresHandle = false
+    tool.CanBeDropped = false
+    tool.Activated:Connect(function()
+        local hrp = root()
+        local mouse = LP:GetMouse()
+        if hrp and mouse and mouse.Hit then
+            hrp.CFrame = CFrame.new(mouse.Hit.Position + Vector3.new(0, 3, 0))
+        end
+    end)
+    tool.Parent = bp
+end
+track(LP.CharacterAdded:Connect(function() task.wait(1) giveTpTool() end))
+
+---------------------------------------------------------------- GUI
+local gui = Instance.new("ScreenGui")
+gui.Name = "HotsRNG_GUI"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+pcall(function() if gethui then gui.Parent = gethui() else gui.Parent = CoreGui end end)
+if not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
+
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(240, 420)
+main.Position = UDim2.fromOffset(20, 80)
+main.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+main.BorderSizePixel = 0
+main.Active = true
+main.Draggable = true
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -40, 0, 30)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "Hot's RNG Menu"
+title.TextColor3 = Color3.fromRGB(255, 150, 40)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 16
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = main
+
+local body = Instance.new("Frame")
+body.Size = UDim2.new(1, 0, 1, -30)
+body.Position = UDim2.fromOffset(0, 30)
+body.BackgroundTransparency = 1
+body.Parent = main
+local layout = Instance.new("UIListLayout", body)
+layout.Padding = UDim.new(0, 5)
+layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local function mk(class, props)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    return o
+end
+
+local function toggle(text, key, onChange)
+    local b = mk("TextButton", {
+        Size = UDim2.new(1, -16, 0, 28), BackgroundColor3 = Color3.fromRGB(50, 50, 62),
+        TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.Gotham, TextSize = 13,
+        BorderSizePixel = 0, Parent = body,
+    })
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    local function refresh()
+        b.Text = text .. ": " .. (State[key] and "ON" or "OFF")
+        b.BackgroundColor3 = State[key] and Color3.fromRGB(40, 140, 70) or Color3.fromRGB(50, 50, 62)
+    end
+    b.MouseButton1Click:Connect(function()
+        State[key] = not State[key]
+        if onChange then onChange(State[key]) end
+        refresh()
+    end)
+    refresh()
+    return b
+end
+
+local function button(text, cb)
+    local b = mk("TextButton", {
+        Size = UDim2.new(1, -16, 0, 28), BackgroundColor3 = Color3.fromRGB(60, 80, 140),
+        Text = text, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.Gotham,
+        TextSize = 13, BorderSizePixel = 0, Parent = body,
+    })
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.MouseButton1Click:Connect(cb)
+    return b
+end
+
+toggle("Auto Rejoin 15m", "AutoRejoin", function(v) startTick = tick() end)
+toggle("Anti AFK", "AntiAFK")
+toggle("Auto Pray", "AutoPray")
+toggle("Auto Pumpkin", "AutoPumpkin")
+toggle("Fly", "Fly", function(v) State.Fly = v; if v then startFly() else stopFly() end end)
+
+local upBtn = button("Fly Up (hold)", function() end)
+upBtn.MouseButton1Down:Connect(function() flyUp = true end)
+upBtn.MouseButton1Up:Connect(function() flyUp = false end)
+upBtn.MouseLeave:Connect(function() flyUp = false end)
+local dnBtn = button("Fly Down (hold)", function() end)
+dnBtn.MouseButton1Down:Connect(function() flyDown = true end)
+dnBtn.MouseButton1Up:Connect(function() flyDown = false end)
+dnBtn.MouseLeave:Connect(function() flyDown = false end)
+
+button("Get Teleport Tool", giveTpTool)
+
+local codeBox = mk("TextBox", {
+    Size = UDim2.new(1, -16, 0, 28), BackgroundColor3 = Color3.fromRGB(40, 40, 50),
+    PlaceholderText = "codes (separate by space/comma)", Text = "",
+    TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.Gotham, TextSize = 12,
+    ClearTextOnFocus = false, BorderSizePixel = 0, Parent = body,
+})
+Instance.new("UICorner", codeBox).CornerRadius = UDim.new(0, 6)
+
+button("Redeem Codes", function()
+    local list = {}
+    for c in string.gmatch(codeBox.Text, "[^%s,;]+") do list[#list+1] = c end
+    for _, c in ipairs(CONFIG.CODES) do list[#list+1] = c end
+    task.spawn(redeemCodes, list)
+end)
+
+logLabel = mk("TextLabel", {
+    Size = UDim2.new(1, -16, 0, 40), BackgroundTransparency = 1, Text = "Log: ready",
+    TextColor3 = Color3.fromRGB(180, 180, 190), Font = Enum.Font.Gotham, TextSize = 11,
+    TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, Parent = body,
+})
+
+local close = mk("TextButton", {
+    Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, -30, 0, 3),
+    BackgroundColor3 = Color3.fromRGB(160, 50, 50), Text = "X",
+    TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13,
+    BorderSizePixel = 0, Parent = main,
+})
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+local mini = false
+local min = mk("TextButton", {
+    Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, -58, 0, 3),
+    BackgroundColor3 = Color3.fromRGB(70, 70, 90), Text = "-",
+    TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14,
+    BorderSizePixel = 0, Parent = main,
+})
+Instance.new("UICorner", min).CornerRadius = UDim.new(0, 6)
+min.MouseButton1Click:Connect(function()
+    mini = not mini
+    body.Visible = not mini
+    main.Size = mini and UDim2.fromOffset(240, 30) or UDim2.fromOffset(240, 420)
+end)
+
+---------------------------------------------------------------- unload
+function getgenv().HotsRNG_Unload()
+    alive = false
+    State.AutoPray, State.AutoPumpkin, State.Fly = false, false, false
+    stopFly()
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    gui:Destroy()
+    getgenv().HotsRNG_Loaded = nil
+end
+close.MouseButton1Click:Connect(function() getgenv().HotsRNG_Unload() end)
+
+giveTpTool()
+log("loaded. Pray/Pumpkin/Codes use name scanner (unverified)")
