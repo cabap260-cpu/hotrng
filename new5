@@ -1,0 +1,933 @@
+--[[
+  Hot's RNG helper v3  |  target executor: Delta (mobile/PC)
+
+  THAY ĐỔI SO VỚI BẢN CŨ:
+   - Auto Pumpkin: KHÔNG teleport nữa. Đi bộ thật (Humanoid:MoveTo), chọn quả gần nhất,
+     delay ngẫu nhiên, giới hạn số quả/phút, nghỉ định kỳ.
+   - Auto Pray: có nhận thông báo (quét GUI + chat + RemoteEvent + giá trị trả về),
+     báo "pray OK" hoặc "NO notification", tự giãn nhịp khi không có phản hồi.
+     Có nút "Spy Remotes" + "Copy Log" để tìm tên remote/thông báo thật của game.
+   - Fly: bay chậm, tăng/giảm tốc mượt, giới hạn tốc độ lên/xuống.
+   - Teleport: gắn nhãn [BAN], mặc định TẮT. Thêm "Walk Tool" (bấm để đi bộ tới, an toàn hơn).
+
+  LƯU Ý: không có script nào đảm bảo 100% không bị ban. Tên remote/prompt của game
+  chưa được xác minh -> xem Log trong GUI và chỉnh CONFIG nếu cần.
+]]
+
+if getgenv().HotsRNG_Loaded then
+    pcall(function() getgenv().HotsRNG_Unload() end)
+end
+getgenv().HotsRNG_Loaded = true
+
+local CONFIG = {
+    REJOIN_MINUTES = 15,
+    SCRIPT_FILE    = "HotsRNG.lua",
+    SCRIPT_URL     = "",              -- optional raw URL for rejoin reload
+
+    -- Pray
+    PRAY_INTERVAL    = 8,             -- giây giữa các lần pray (có random +-20%)
+    PRAY_WAIT_NOTICE = 3,             -- chờ bao lâu để thấy thông báo sau khi pray
+    PRAY_MAX_DIST    = 150,           -- tối đa đi bộ tới bàn thờ/altar
+    PRAY_METHODS     = { "remote", "prompt", "button" },   -- thứ tự thử; bỏ bớt nếu muốn
+    PRAY_PATTERNS    = { "pray", "altar", "shrine", "worship" },            -- tên remote/prompt
+    PRAY_NOTICE_PATTERNS = { "pray", "bless", "cooldown" },       -- chữ trong thông báo (chữ thường)
+
+    -- Pumpkin
+    PUMPKIN_PATTERNS    = { "pumpkin" },
+    PUMPKIN_SCAN_MIN    = 1.5,        -- nghỉ ngẫu nhiên giữa các lần quét (giây)
+    PUMPKIN_SCAN_MAX    = 3.5,
+    PUMPKIN_MAX_DIST    = 250,        -- chỉ đi tới quả trong phạm vi này
+    PUMPKIN_MAX_PER_MIN = 8,          -- tối đa số quả/phút
+    PUMPKIN_REST_EVERY  = 12,         -- cứ N quả thì nghỉ 15-40s
+    PUMPKIN_TELE_MAX_PER_MIN = 5,     -- chế độ Tele: giới hạn thấp hơn
+    AUTO_NOCLIP         = true,       -- kẹt vật cản khi đi bộ -> tự noclip
+    NOCLIP_SPEED        = 20,         -- studs/giây khi noclip tới quả
+    WALK_TIMEOUT        = 20,         -- quá thời gian này thì bỏ quả đó 30s
+
+    -- Code
+    CODE_REMOTE_PATTERNS = { "redeem", "code" },
+    CODES = {                         -- put valid codes here (not verified)
+        -- "EXAMPLECODE",
+    },
+
+    -- Fly (chậm để tránh bị phát hiện)
+    FLY_SPEED    = 22,                -- studs/giây (đi bộ mặc định = 16)
+    FLY_VERTICAL = 10,                -- tốc độ lên/xuống tối đa
+    FLY_ACCEL    = 3,                 -- càng nhỏ càng mượt/chậm tăng tốc
+}
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local TeleportService   = game:GetService("TeleportService")
+local VirtualUser       = game:GetService("VirtualUser")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CoreGui           = game:GetService("CoreGui")
+local LP = Players.LocalPlayer
+
+local State = {
+    AutoPray = false, AutoPumpkin = false, Fly = false,
+    AutoRejoin = true, AntiAFK = true,
+    Spy = false, AllowTP = false, PumpkinTele = false, Noclip = false,
+}
+local conns, alive = {}, true
+local function track(c) conns[#conns+1] = c return c end
+
+---------------------------------------------------------------- log
+local logLabel
+local logHistory = {}
+local function log(msg)
+    msg = tostring(msg)
+    logHistory[#logHistory+1] = os.date("%H:%M:%S") .. " " .. msg
+    if #logHistory > 80 then table.remove(logHistory, 1) end
+    if logLabel then logLabel.Text = "Log: " .. msg end
+end
+
+local function lower(s) return string.lower(tostring(s)) end
+local function matches(name, patterns)
+    local n = lower(name)
+    for _, p in ipairs(patterns) do if string.find(n, p, 1, true) then return true end end
+    return false
+end
+local function rand(a, b) return a + math.random() * (b - a) end
+local function jitter(base, pct) return base * (1 + (math.random() * 2 - 1) * pct) end
+local function root()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart"), c and c:FindFirstChildOfClass("Humanoid")
+end
+
+---------------------------------------------------------------- Anti AFK
+track(LP.Idled:Connect(function()
+    if not State.AntiAFK then return end
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end))
+task.spawn(function()
+    while alive do
+        task.wait(60)
+        if State.AntiAFK then
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new())
+            end)
+        end
+    end
+end)
+
+---------------------------------------------------------------- Anti Kick
+do
+    local ok, err = pcall(function()
+        assert(hookmetamethod and getnamecallmethod, "hookmetamethod unsupported")
+        local oldNamecall
+        local wrap = newcclosure or function(f) return f end
+        oldNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+            local method = getnamecallmethod()
+            if self == LP and typeof(method) == "string" and lower(method) == "kick" then
+                return
+            end
+            return oldNamecall(self, ...)
+        end))
+    end)
+    if not ok then warn("[HotsRNG] AntiKick not active: " .. tostring(err)) end
+end
+
+---------------------------------------------------------------- Auto Rejoin
+local function queueReload()
+    local q = queue_on_teleport or (syn and syn.queue_on_teleport)
+    if not q then return end
+    local code
+    if CONFIG.SCRIPT_URL ~= "" then
+        code = ('loadstring(game:HttpGet("%s"))()'):format(CONFIG.SCRIPT_URL)
+    else
+        code = ('local f=isfile and isfile("%s") and readfile("%s"); if f then loadstring(f)() end')
+            :format(CONFIG.SCRIPT_FILE, CONFIG.SCRIPT_FILE)
+    end
+    pcall(q, code)
+end
+local startTick = tick()
+task.spawn(function()
+    while alive do
+        task.wait(5)
+        if State.AutoRejoin and tick() - startTick >= CONFIG.REJOIN_MINUTES * 60 then
+            queueReload()
+            local ok = pcall(function() TeleportService:Teleport(game.PlaceId, LP) end)
+            startTick = tick() + 30
+            if not ok then log("rejoin failed, retrying") end
+        end
+    end
+end)
+pcall(function()
+    track(game:GetService("GuiService").ErrorMessageChanged:Connect(function()
+        if State.AutoRejoin then
+            queueReload()
+            task.wait(2)
+            pcall(function() TeleportService:Teleport(game.PlaceId, LP) end)
+        end
+    end))
+end)
+
+---------------------------------------------------------------- helpers: scan / fire / walk
+local function fireTarget(inst)
+    if inst:IsA("ProximityPrompt") then
+        pcall(function() if inst.HoldDuration > 0 then inst.HoldDuration = 0 end end)
+        if fireproximityprompt then fireproximityprompt(inst) return true end
+    elseif inst:IsA("ClickDetector") then
+        if fireclickdetector then fireclickdetector(inst) return true end
+    end
+    return false
+end
+
+local function findInteractables(patterns, scope)
+    local out = {}
+    for _, d in ipairs(scope:GetDescendants()) do
+        if d:IsA("ProximityPrompt") or d:IsA("ClickDetector") then
+            local p = d.Parent
+            if matches(d.Name, patterns) or (p and matches(p.Name, patterns))
+               or (p and p.Parent and matches(p.Parent.Name, patterns)) then
+                out[#out+1] = d
+            end
+        end
+    end
+    return out
+end
+
+local function findRemotes(patterns)
+    local out = {}
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        if (d:IsA("RemoteEvent") or d:IsA("RemoteFunction")) and matches(d.Name, patterns) then
+            out[#out+1] = d
+        end
+    end
+    return out
+end
+
+local function partOf(inst)
+    if inst:IsA("BasePart") then return inst end
+    local p = inst.Parent
+    while p and not p:IsA("BasePart") do
+        if p:IsA("Model") then return p.PrimaryPart or p:FindFirstChildWhichIsA("BasePart", true) end
+        p = p.Parent
+    end
+    return p
+end
+
+-- Noclip (CanCollide=false cho nhân vật; tự khôi phục khi tắt)
+local noclipSaved, noclipAuto = {}, false
+track(RunService.Stepped:Connect(function()
+    local want = noclipAuto or State.Noclip
+    if not want then
+        if next(noclipSaved) then
+            for p, was in pairs(noclipSaved) do if p.Parent then p.CanCollide = was end end
+            noclipSaved = {}
+        end
+        return
+    end
+    local c = LP.Character
+    if not c then return end
+    for _, p in ipairs(c:GetDescendants()) do
+        if p:IsA("BasePart") then
+            if noclipSaved[p] == nil then noclipSaved[p] = p.CanCollide end
+            p.CanCollide = false
+        end
+    end
+end))
+
+-- Khi kẹt: noclip + trượt chậm thẳng tới mục tiêu (giữ độ cao để không rơi xuyên map)
+local function noclipWalk(part, stopDist, timeout)
+    noclipAuto = true
+    local ok, t0 = false, tick()
+    local lift = stopDist > 4 and 3 or 0
+    while alive and tick() - t0 < timeout do
+        local hrp = root()
+        if not (hrp and part.Parent) then break end
+        if (hrp.Position - part.Position).Magnitude <= stopDist then ok = true break end
+        local delta = (part.Position + Vector3.new(0, lift, 0)) - hrp.Position
+        local dt = task.wait()
+        if delta.Magnitude > 0.01 then
+            local step = math.min(delta.Magnitude, CONFIG.NOCLIP_SPEED * dt)
+            hrp.CFrame = hrp.CFrame + delta.Unit * step
+        end
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    end
+    noclipAuto = false
+    return ok
+end
+
+-- Đi bộ thật bằng Humanoid:MoveTo; kẹt -> nhảy -> noclip
+local function walkTo(part, stopDist, timeout)
+    if State.Fly then log("tắt Fly để tự đi bộ") return false end
+    local hrp, hum = root()
+    if not (hrp and hum and part) then return false end
+    local t0 = tick()
+    local lastPos, lastCheck, stuck = hrp.Position, tick(), 0
+    while alive and tick() - t0 < timeout do
+        hrp, hum = root()
+        if not (hrp and hum and part.Parent) then return false end
+        if (hrp.Position - part.Position).Magnitude <= stopDist then
+            hum:MoveTo(hrp.Position)
+            return true
+        end
+        hum:MoveTo(part.Position)
+        task.wait(0.25)
+        if tick() - lastCheck >= 1.5 then
+            if hrp.Parent and (hrp.Position - lastPos).Magnitude < 1 then
+                stuck += 1
+                if stuck == 1 then
+                    hum.Jump = true
+                elseif CONFIG.AUTO_NOCLIP then
+                    log("kẹt vật cản -> noclip")
+                    return noclipWalk(part, stopDist, math.max(timeout - (tick() - t0), 8))
+                end
+            else
+                stuck = 0
+            end
+            lastPos, lastCheck = hrp.Position, tick()
+        end
+    end
+    return false
+end
+
+---------------------------------------------------------------- Notification / event recorder
+local prayNotice = { t = 0, text = "" }
+local recent = {}   -- sự kiện gần đây (remote server / đổi chữ GUI) để chẩn đoán
+local function record(s)
+    recent[#recent+1] = { t = tick(), s = s }
+    if #recent > 80 then table.remove(recent, 1) end
+end
+local function setNotice(text)
+    prayNotice.t = tick()
+    prayNotice.text = tostring(text)
+    log("notice: " .. prayNotice.text)
+end
+local function inOurGui(d)
+    local p = d
+    while p do
+        if p.Name == "HotsRNG_GUI" then return true end
+        p = p.Parent
+    end
+    return false
+end
+
+local function argsToStr(...)
+    local t = {}
+    for i = 1, select("#", ...) do t[#t+1] = tostring((select(i, ...))) end
+    return string.sub(table.concat(t, ", "), 1, 90)
+end
+
+-- RemoteEvent từ server (thông báo thường đi qua đây)
+local function hookRemote(r)
+    if not r:IsA("RemoteEvent") then return end
+    pcall(function()
+        track(r.OnClientEvent:Connect(function(...)
+            record("R:" .. r.Name)
+            if State.Spy then log("[S] " .. r.Name .. "(" .. argsToStr(...) .. ")") end
+            for i = 1, select("#", ...) do
+                local a = select(i, ...)
+                if type(a) == "string" and matches(a, CONFIG.PRAY_NOTICE_PATTERNS) then
+                    setNotice(a)
+                    break
+                end
+            end
+        end))
+    end)
+end
+for _, d in ipairs(ReplicatedStorage:GetDescendants()) do hookRemote(d) end
+track(ReplicatedStorage.DescendantAdded:Connect(hookRemote))
+
+pcall(function()
+    local TCS = game:GetService("TextChatService")
+    track(TCS.MessageReceived:Connect(function(m)
+        if m.Text then
+            record("C:" .. m.Text)
+            if matches(m.Text, CONFIG.PRAY_NOTICE_PATTERNS) then setNotice(m.Text) end
+        end
+    end))
+end)
+
+---------------------------------------------------------------- Auto Pray (3 cách: remote / prompt / nút GUI)
+local function pressButton(b)
+    local n = 0
+    if getconnections then
+        for _, ev in ipairs({ "Activated", "MouseButton1Click", "MouseButton1Down" }) do
+            local cs = {}
+            pcall(function() cs = getconnections(b[ev]) end)
+            for _, c in ipairs(cs) do
+                pcall(function() c:Fire() end)
+                n += 1
+            end
+            if n > 0 then break end
+        end
+    end
+    if n == 0 and firesignal then
+        pcall(function() firesignal(b.MouseButton1Click) n += 1 end)
+    end
+    return n > 0
+end
+
+local function findPrayButtons()
+    local out = {}
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return out end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextButton") or d:IsA("ImageButton")) and not inOurGui(d) then
+            local hit = matches(d.Name, CONFIG.PRAY_PATTERNS)
+                or (d:IsA("TextButton") and matches(d.Text, CONFIG.PRAY_PATTERNS))
+            if not hit then
+                for _, c in ipairs(d:GetChildren()) do
+                    if c:IsA("TextLabel") and matches(c.Text, CONFIG.PRAY_PATTERNS) then hit = true break end
+                end
+            end
+            if hit then out[#out+1] = d end
+        end
+    end
+    return out
+end
+
+local function prayVia(method)
+    local fired = 0
+    if method == "remote" then
+        for _, r in ipairs(findRemotes(CONFIG.PRAY_PATTERNS)) do
+            fired += 1
+            if r:IsA("RemoteEvent") then
+                pcall(r.FireServer, r)
+            else
+                task.spawn(function()
+                    local ok, res = pcall(r.InvokeServer, r)
+                    if ok and res ~= nil then setNotice("return: " .. tostring(res)) end
+                end)
+            end
+            task.wait(rand(0.2, 0.5))
+        end
+    elseif method == "button" then
+        for _, b in ipairs(findPrayButtons()) do
+            if pressButton(b) then fired += 1 end
+            task.wait(rand(0.2, 0.5))
+        end
+    elseif method == "prompt" then
+        local hrp = root()
+        local best, bestPart, bestD
+        for _, it in ipairs(findInteractables(CONFIG.PRAY_PATTERNS, workspace)) do
+            local part = partOf(it)
+            if hrp and part then
+                local d = (hrp.Position - part.Position).Magnitude
+                if d <= CONFIG.PRAY_MAX_DIST and (not bestD or d < bestD) then
+                    best, bestPart, bestD = it, part, d
+                end
+            end
+        end
+        if best then
+            local reach = math.max((best.MaxActivationDistance or 10) - 3, 4)
+            local near = bestD <= reach or walkTo(bestPart, reach, CONFIG.WALK_TIMEOUT)
+            if near then
+                task.wait(rand(0.4, 1.0))
+                if fireTarget(best) then fired += 1 end
+            end
+        end
+    end
+    return fired
+end
+
+local function waitNotice(before)
+    local t0 = tick()
+    while tick() - t0 < CONFIG.PRAY_WAIT_NOTICE and prayNotice.t <= before do
+        task.wait(0.2)
+    end
+    return prayNotice.t > before
+end
+
+-- liệt kê những gì server/GUI phản hồi sau khi pray (để biết game thật sự dùng gì)
+local function diagnose(startT)
+    local seen, list = {}, {}
+    for _, e in ipairs(recent) do
+        if e.t >= startT and not seen[e.s] and #list < 5 then
+            seen[e.s] = true
+            list[#list+1] = string.sub(e.s, 1, 40)
+        end
+    end
+    if #list > 0 then
+        log("sau pray thấy: " .. table.concat(list, " | "))
+    else
+        log("sau pray: server/GUI không phản hồi gì")
+    end
+end
+
+local prayMethod
+local function doPray()
+    local order = {}
+    if prayMethod then order[1] = prayMethod end
+    for _, m in ipairs(CONFIG.PRAY_METHODS) do
+        if m ~= prayMethod then order[#order+1] = m end
+    end
+    local triedAny = false
+    for _, m in ipairs(order) do
+        local before, startT = prayNotice.t, tick()
+        local fired = prayVia(m)
+        if fired > 0 then
+            triedAny = true
+            if waitNotice(before) then
+                prayMethod = m
+                log("pray OK [" .. m .. "]: " .. prayNotice.text)
+                return true
+            end
+            log("pray [" .. m .. "] x" .. fired .. ": không có thông báo")
+            diagnose(startT)
+            task.wait(rand(1, 2))
+        end
+    end
+    if not triedAny then
+        log("pray: không thấy remote/prompt/nút khớp -> bấm 'Scan Pray'")
+    end
+    return false
+end
+
+task.spawn(function()
+    local misses = 0
+    while alive do
+        task.wait(jitter(CONFIG.PRAY_INTERVAL, 0.2) * math.min(2 ^ misses, 12))
+        if State.AutoPray then
+            local ok = doPray()
+            misses = ok and 0 or math.min(misses + 1, 4)
+        else
+            misses = 0
+        end
+    end
+end)
+
+-- Quét mọi thứ có tên/chữ giống "pray" -> ghi vào log (bấm Copy Log để gửi)
+function scanPray()
+    local n = 0
+    local pats = CONFIG.PRAY_PATTERNS
+    local roots = { workspace, ReplicatedStorage, LP:FindFirstChild("PlayerGui"), LP:FindFirstChild("Backpack") }
+    for _, r in ipairs(roots) do
+        for _, d in ipairs(r:GetDescendants()) do
+            if n >= 40 then break end
+            if not inOurGui(d) then
+                local hit = matches(d.Name, pats)
+                if not hit and (d:IsA("TextLabel") or d:IsA("TextButton")) then
+                    hit = matches(d.Text, pats)
+                end
+                if hit then
+                    n += 1
+                    log("scan: [" .. d.ClassName .. "] " .. d:GetFullName())
+                end
+            end
+        end
+    end
+    log("scan xong: " .. n .. " mục. Bấm Copy Log để gửi cho mình")
+end
+
+---------------------------------------------------------------- Auto Pumpkin (Walk hoặc Tele)
+local function findPumpkinTargets()
+    local out = {}
+    for _, it in ipairs(findInteractables(CONFIG.PUMPKIN_PATTERNS, workspace)) do
+        out[#out+1] = { inst = it, part = partOf(it), touch = false }
+    end
+    if #out == 0 then -- nhặt bằng chạm: tới gần là tự nhặt
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d:IsA("BasePart") and d:FindFirstChildOfClass("TouchTransmitter")
+               and (matches(d.Name, CONFIG.PUMPKIN_PATTERNS)
+                    or (d.Parent and matches(d.Parent.Name, CONFIG.PUMPKIN_PATTERNS))) then
+                out[#out+1] = { inst = d, part = d, touch = true }
+            end
+        end
+    end
+    return out
+end
+
+-- Chế độ TELE: dịch chuyển tới quả rồi quay lại chỗ cũ (NGUY CƠ BAN)
+local function teleCollect(best)
+    local hrp = root()
+    if not (hrp and best.part and best.part.Parent) then return false end
+    local back = hrp.CFrame
+    hrp.CFrame = best.part.CFrame + Vector3.new(0, 3, 0)
+    task.wait(rand(0.4, 0.9))
+    if not best.touch then fireTarget(best.inst) else task.wait(0.3) end
+    task.wait(rand(0.3, 0.7))
+    local hrp2 = root()
+    if hrp2 then hrp2.CFrame = back end
+    return true
+end
+
+local pumpkinSkip, pumpkinTimes, pumpkinCount = {}, {}, 0
+task.spawn(function()
+    while alive do
+        if State.PumpkinTele then
+            task.wait(rand(3, 6))
+        else
+            task.wait(rand(CONFIG.PUMPKIN_SCAN_MIN, CONFIG.PUMPKIN_SCAN_MAX))
+        end
+        if not (State.AutoPumpkin and root()) then continue end
+
+        local now = tick()
+        for i = #pumpkinTimes, 1, -1 do
+            if now - pumpkinTimes[i] > 60 then table.remove(pumpkinTimes, i) end
+        end
+        local cap = State.PumpkinTele and CONFIG.PUMPKIN_TELE_MAX_PER_MIN or CONFIG.PUMPKIN_MAX_PER_MIN
+        if #pumpkinTimes >= cap then
+            log("pumpkin: đạt giới hạn/phút, nghỉ")
+            continue
+        end
+
+        local hrp = root()
+        local best, bestD
+        for _, t in ipairs(findPumpkinTargets()) do
+            local skipUntil = pumpkinSkip[t.inst]
+            if t.part and t.inst.Parent and not (skipUntil and skipUntil > now) then
+                local d = (hrp.Position - t.part.Position).Magnitude
+                if d <= CONFIG.PUMPKIN_MAX_DIST and (not bestD or d < bestD) then
+                    best, bestD = t, d
+                end
+            end
+        end
+        if not best then log("pumpkin: none found") continue end
+
+        local ok = false
+        if State.PumpkinTele then
+            log("⚠ pumpkin TELE (nguy cơ BAN)")
+            ok = teleCollect(best)
+        else
+            local reach = best.touch and 2 or math.max((best.inst.MaxActivationDistance or 10) - 3, 4)
+            ok = walkTo(best.part, reach, CONFIG.WALK_TIMEOUT)
+            if ok and State.AutoPumpkin and best.inst.Parent then
+                task.wait(rand(0.5, 1.4))
+                if not best.touch then fireTarget(best.inst) end
+            else
+                ok = false
+            end
+        end
+
+        if ok then
+            pumpkinTimes[#pumpkinTimes+1] = tick()
+            pumpkinCount += 1
+            log("pumpkin #" .. pumpkinCount .. " (" .. #pumpkinTimes .. "/" .. cap .. " phút này)")
+            if pumpkinCount % CONFIG.PUMPKIN_REST_EVERY == 0 then
+                log("pumpkin: nghỉ ngắn")
+                task.wait(rand(15, 40))
+            end
+        else
+            pumpkinSkip[best.inst] = tick() + 30 -- kẹt/không tới được: bỏ 30s
+        end
+    end
+end)
+
+---------------------------------------------------------------- Redeem codes
+local function redeemCodes(codes)
+    codes = codes or CONFIG.CODES
+    if #codes == 0 then log("no codes to redeem") return end
+    local remotes = findRemotes(CONFIG.CODE_REMOTE_PATTERNS)
+    if #remotes == 0 then log("code remote not found") return end
+    local used = 0
+    for _, code in ipairs(codes) do
+        for _, r in ipairs(remotes) do
+            pcall(function()
+                if r:IsA("RemoteEvent") then r:FireServer(code) else r:InvokeServer(code) end
+            end)
+        end
+        used += 1
+        task.wait(rand(1.0, 2.0))
+    end
+    log("redeem sent: " .. used .. " code(s) via " .. #remotes .. " remote(s)")
+end
+
+---------------------------------------------------------------- Fly (chậm, mượt)
+local flyBV, flyBG, flyUp, flyDown = nil, nil, false, false
+local flyVel = Vector3.zero
+local function stopFly()
+    if flyBV then flyBV:Destroy() flyBV = nil end
+    if flyBG then flyBG:Destroy() flyBG = nil end
+    flyVel = Vector3.zero
+    local _, hum = root()
+    if hum then hum.PlatformStand = false end
+end
+local function startFly()
+    local hrp, hum = root()
+    if not hrp then return end
+    stopFly()
+    flyBV = Instance.new("BodyVelocity")
+    flyBV.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+    flyBV.Velocity = Vector3.zero
+    flyBV.Parent = hrp
+    flyBG = Instance.new("BodyGyro")
+    flyBG.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+    flyBG.P = 1e4
+    flyBG.CFrame = hrp.CFrame
+    flyBG.Parent = hrp
+    hum.PlatformStand = true
+end
+track(RunService.RenderStepped:Connect(function(dt)
+    if not State.Fly then return end
+    local hrp, hum = root()
+    if not (hrp and hum and flyBV and flyBV.Parent) then return end
+    local cam = workspace.CurrentCamera
+    local move = hum.MoveDirection
+    local target = Vector3.zero
+    if move.Magnitude > 0 then
+        local look = cam.CFrame.LookVector
+        local right = cam.CFrame.RightVector
+        local flatLook = Vector3.new(look.X, 0, look.Z)
+        local flatRight = Vector3.new(right.X, 0, right.Z)
+        local fwd = flatLook.Magnitude > 0 and move:Dot(flatLook.Unit) or 0
+        local side = flatRight.Magnitude > 0 and move:Dot(flatRight.Unit) or 0
+        target = look * fwd + right * side
+    end
+    if flyUp then target += Vector3.yAxis end
+    if flyDown then target -= Vector3.yAxis end
+    target = target * CONFIG.FLY_SPEED
+    -- giới hạn tốc độ lên/xuống
+    local y = math.clamp(target.Y, -CONFIG.FLY_VERTICAL, CONFIG.FLY_VERTICAL)
+    target = Vector3.new(target.X, y, target.Z)
+    -- tăng/giảm tốc mượt
+    flyVel = flyVel:Lerp(target, math.clamp(dt * CONFIG.FLY_ACCEL, 0, 1))
+    flyBV.Velocity = flyVel
+    flyBG.CFrame = cam.CFrame
+end))
+track(LP.CharacterAdded:Connect(function()
+    task.wait(1)
+    if State.Fly then startFly() end
+end))
+local function setFly(v)
+    State.Fly = v
+    if v then startFly() else stopFly() end
+end
+
+---------------------------------------------------------------- Tools
+local function giveTool(name, onActivate)
+    local bp = LP:FindFirstChildOfClass("Backpack")
+    if not bp then return end
+    if bp:FindFirstChild(name) or (LP.Character and LP.Character:FindFirstChild(name)) then return end
+    local tool = Instance.new("Tool")
+    tool.Name = name
+    tool.RequiresHandle = false
+    tool.CanBeDropped = false
+    tool.Activated:Connect(function()
+        local mouse = LP:GetMouse()
+        if mouse and mouse.Hit then onActivate(mouse.Hit.Position) end
+    end)
+    tool.Parent = bp
+end
+
+-- An toàn: bấm để đi bộ tới điểm đó
+local function giveWalkTool()
+    giveTool("Walk Tool", function(pos)
+        local _, hum = root()
+        if hum and not State.Fly then hum:MoveTo(pos) end
+    end)
+end
+
+-- NGUY HIỂM: teleport tức thời -> dễ bị ban. Mặc định tắt.
+local function giveTpTool()
+    giveTool("Teleport Tool [BAN]", function(pos)
+        if not State.AllowTP then
+            log("Teleport = NGUY CƠ BAN. Bật 'Allow Teleport [BAN]' nếu vẫn muốn dùng")
+            return
+        end
+        local hrp = root()
+        if hrp then
+            log("⚠ TELEPORT: nguy cơ BAN")
+            hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+        end
+    end)
+end
+track(LP.CharacterAdded:Connect(function() task.wait(1) giveWalkTool() end))
+
+---------------------------------------------------------------- GUI
+local gui = Instance.new("ScreenGui")
+gui.Name = "HotsRNG_GUI"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+pcall(function() if gethui then gui.Parent = gethui() else gui.Parent = CoreGui end end)
+if not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
+
+local GUI_H = 360
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(250, GUI_H)
+main.Position = UDim2.fromOffset(20, 60)
+main.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+main.BorderSizePixel = 0
+main.Active = true
+main.Draggable = true
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -70, 0, 30)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "Hot's RNG Menu v3"
+title.TextColor3 = Color3.fromRGB(255, 150, 40)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 16
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = main
+
+local body = Instance.new("ScrollingFrame")
+body.Size = UDim2.new(1, 0, 1, -34)
+body.Position = UDim2.fromOffset(0, 32)
+body.BackgroundTransparency = 1
+body.BorderSizePixel = 0
+body.ScrollBarThickness = 4
+body.CanvasSize = UDim2.new()
+body.AutomaticCanvasSize = Enum.AutomaticSize.Y
+body.Parent = main
+local layout = Instance.new("UIListLayout", body)
+layout.Padding = UDim.new(0, 5)
+layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local function mk(class, props)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    return o
+end
+
+local function toggle(text, key, onChange, warnColor)
+    local b = mk("TextButton", {
+        Size = UDim2.new(1, -16, 0, 28), BackgroundColor3 = Color3.fromRGB(50, 50, 62),
+        TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.Gotham, TextSize = 13,
+        BorderSizePixel = 0, Parent = body,
+    })
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    local onColor = warnColor or Color3.fromRGB(40, 140, 70)
+    local function refresh()
+        b.Text = text .. ": " .. (State[key] and "ON" or "OFF")
+        b.BackgroundColor3 = State[key] and onColor or Color3.fromRGB(50, 50, 62)
+    end
+    b.MouseButton1Click:Connect(function()
+        State[key] = not State[key]
+        if onChange then onChange(State[key]) end
+        refresh()
+    end)
+    refresh()
+    return b
+end
+
+local function button(text, cb, color)
+    local b = mk("TextButton", {
+        Size = UDim2.new(1, -16, 0, 28), BackgroundColor3 = color or Color3.fromRGB(60, 80, 140),
+        Text = text, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.Gotham,
+        TextSize = 13, BorderSizePixel = 0, Parent = body,
+    })
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.MouseButton1Click:Connect(cb)
+    return b
+end
+
+toggle("Auto Rejoin 15m", "AutoRejoin", function() startTick = tick() end)
+toggle("Anti AFK", "AntiAFK")
+toggle("Auto Pray", "AutoPray")
+toggle("Auto Pumpkin", "AutoPumpkin")
+toggle("Pumpkin Tele [BAN]", "PumpkinTele", nil, Color3.fromRGB(170, 50, 50))
+toggle("Noclip (manual)", "Noclip")
+toggle("Fly (slow)", "Fly", setFly)
+
+local upBtn = button("Fly Up (hold)", function() end)
+upBtn.MouseButton1Down:Connect(function() flyUp = true end)
+upBtn.MouseButton1Up:Connect(function() flyUp = false end)
+upBtn.MouseLeave:Connect(function() flyUp = false end)
+local dnBtn = button("Fly Down (hold)", function() end)
+dnBtn.MouseButton1Down:Connect(function() flyDown = true end)
+dnBtn.MouseButton1Up:Connect(function() flyDown = false end)
+dnBtn.MouseLeave:Connect(function() flyDown = false end)
+
+button("Get Walk Tool (safe)", giveWalkTool, Color3.fromRGB(40, 120, 90))
+toggle("Allow Teleport [BAN]", "AllowTP", nil, Color3.fromRGB(170, 50, 50))
+button("Get Teleport Tool [BAN]", giveTpTool, Color3.fromRGB(150, 60, 60))
+
+toggle("Spy Remotes (log)", "Spy")
+button("Scan Pray (log)", function() task.spawn(scanPray) end)
+button("Copy Log", function()
+    local text = table.concat(logHistory, "\n")
+    if setclipboard then
+        setclipboard(text)
+        log("log copied (" .. #logHistory .. " lines)")
+    else
+        log("setclipboard unsupported")
+    end
+end)
+
+local codeBox = mk("TextBox", {
+    Size = UDim2.new(1, -16, 0, 28), BackgroundColor3 = Color3.fromRGB(40, 40, 50),
+    PlaceholderText = "codes (separate by space/comma)", Text = "",
+    TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.Gotham, TextSize = 12,
+    ClearTextOnFocus = false, BorderSizePixel = 0, Parent = body,
+})
+Instance.new("UICorner", codeBox).CornerRadius = UDim.new(0, 6)
+
+button("Redeem Codes", function()
+    local list = {}
+    for c in string.gmatch(codeBox.Text, "[^%s,;]+") do list[#list+1] = c end
+    for _, c in ipairs(CONFIG.CODES) do list[#list+1] = c end
+    task.spawn(redeemCodes, list)
+end)
+
+logLabel = mk("TextLabel", {
+    Size = UDim2.new(1, -16, 0, 60), BackgroundTransparency = 1, Text = "Log: ready",
+    TextColor3 = Color3.fromRGB(180, 180, 190), Font = Enum.Font.Gotham, TextSize = 11,
+    TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, Parent = body,
+})
+
+local close = mk("TextButton", {
+    Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, -30, 0, 3),
+    BackgroundColor3 = Color3.fromRGB(160, 50, 50), Text = "X",
+    TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13,
+    BorderSizePixel = 0, Parent = main,
+})
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+local mini = false
+local min = mk("TextButton", {
+    Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, -58, 0, 3),
+    BackgroundColor3 = Color3.fromRGB(70, 70, 90), Text = "-",
+    TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14,
+    BorderSizePixel = 0, Parent = main,
+})
+Instance.new("UICorner", min).CornerRadius = UDim.new(0, 6)
+min.MouseButton1Click:Connect(function()
+    mini = not mini
+    body.Visible = not mini
+    main.Size = mini and UDim2.fromOffset(250, 30) or UDim2.fromOffset(250, GUI_H)
+end)
+
+---------------------------------------------------------------- GUI-text watcher (PlayerGui)
+do
+    local PG = LP:WaitForChild("PlayerGui")
+    local function onText(d)
+        local txt = d.Text
+        if txt ~= "" then
+            record("G:" .. txt)
+            if matches(txt, CONFIG.PRAY_NOTICE_PATTERNS) then setNotice(txt) end
+        end
+    end
+    local function hookText(d)
+        if not (d:IsA("TextLabel") or d:IsA("TextButton")) then return end
+        if d:IsDescendantOf(gui) then return end
+        pcall(function()
+            track(d:GetPropertyChangedSignal("Text"):Connect(function() onText(d) end))
+        end)
+    end
+    for _, d in ipairs(PG:GetDescendants()) do hookText(d) end
+    track(PG.DescendantAdded:Connect(function(d)
+        task.defer(function()
+            hookText(d)
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and not d:IsDescendantOf(gui) then
+                onText(d) -- thông báo mới được clone vào GUI
+            end
+        end)
+    end))
+end
+
+---------------------------------------------------------------- unload
+getgenv().HotsRNG_Unload = function()
+    alive = false
+    State.AutoPray, State.AutoPumpkin, State.Fly = false, false, false
+    stopFly()
+    State.Noclip, noclipAuto = false, false
+    for p, was in pairs(noclipSaved) do if p.Parent then p.CanCollide = was end end
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    gui:Destroy()
+    getgenv().HotsRNG_Loaded = nil
+end
+close.MouseButton1Click:Connect(function() getgenv().HotsRNG_Unload() end)
+
+giveWalkTool()
+log("loaded v3. Pray/Pumpkin/Codes dùng name scanner (chưa xác minh)")
